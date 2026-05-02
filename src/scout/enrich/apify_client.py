@@ -37,13 +37,21 @@ logger = structlog.get_logger(__name__)
 # -----------------------------------------------------------------------------
 # Actor configuration
 # -----------------------------------------------------------------------------
-# The TikTok scraper actor we use. Swap here if we change vendors;
-# call sites should not need to know which actor is in use.
+
+# Profile + recent-posts actor. Used for full creator enrichment.
 TIKTOK_PROFILE_ACTOR = "clockworks/tiktok-scraper"
+
+# Search-by-keyword actor. Used for the search-term harvest channel.
+# Returns posts matching a query string; we extract creator handles from those.
+TIKTOK_SEARCH_ACTOR = "clockworks/tiktok-scraper"
 
 # Default cap on posts returned per profile fetch. Most scoring signals
 # stabilize with 30-50 recent posts; pulling more is wasted spend.
 DEFAULT_POSTS_PER_PROFILE = 30
+
+# Default cap on posts returned per search-term query. Tuned for cost vs.
+# discovery yield: more posts surface more creators but linearly increase cost.
+DEFAULT_POSTS_PER_SEARCH = 30
 
 # Hard timeout for actor runs. If TikTok or Apify is having a bad day,
 # we'd rather fail fast and let the job retry than block forever.
@@ -104,6 +112,27 @@ class TikTokProfile:
     fetched_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+@dataclass
+class SearchHit:
+    """A single creator surfaced by a search-term query.
+
+    Lightweight summary — just enough to decide whether to enrich this
+    creator further. Full profile/post data is fetched separately during
+    enrichment, only on candidates we actually want to track.
+    """
+
+    tiktok_user_id: str
+    handle: str
+    display_name: str | None
+    follower_count: int | None  # not always provided by search results
+    bio: str | None
+
+    # The post that surfaced this creator. Useful for diagnostics —
+    # e.g., looking at which posts a "reaction" search actually returned.
+    surfacing_post_id: str
+    surfacing_post_caption: str | None
+
+
 # -----------------------------------------------------------------------------
 # Exceptions
 # -----------------------------------------------------------------------------
@@ -138,16 +167,15 @@ class UnexpectedResponseShape(ApifyError):
 
 
 class TikTokApifyClient:
-    """Thin wrapper around the Apify SDK for TikTok scraping.
-
-    Single-purpose at v1: fetch a creator's profile + recent posts by handle.
-    More methods (sound search, hashtag search, etc.) will be added as the
-    harvest channels are built out.
-    """
+    """Thin wrapper around the Apify SDK for TikTok scraping."""
 
     def __init__(self, api_token: str | None = None) -> None:
         token = api_token or get_settings().apify_api_token
         self._client = ApifyClient(token)
+
+    # -------------------------------------------------------------------------
+    # Profile fetching
+    # -------------------------------------------------------------------------
 
     @retry(
         retry=retry_if_exception_type(ActorRunFailed),
@@ -174,8 +202,6 @@ class TikTokApifyClient:
             ActorRunFailed: Actor run failed (after retries).
             UnexpectedResponseShape: Response shape changed; parser needs updating.
         """
-        # Normalize handle: actors typically expect a profile URL or username
-        # without the @ prefix, but accept both forms for caller convenience.
         clean_handle = handle.lstrip("@").strip()
         if not clean_handle:
             raise ValueError("handle must be a non-empty string")
@@ -183,9 +209,6 @@ class TikTokApifyClient:
         log = logger.bind(handle=clean_handle, actor=TIKTOK_PROFILE_ACTOR)
         log.info("fetching_profile", posts_limit=posts_limit)
 
-        # Actor input. The clockworks/tiktok-scraper actor accepts a list of
-        # profile URLs and a results-per-page parameter. Configuration here
-        # is intentionally minimal — we only set what we need.
         actor_input = {
             "profiles": [clean_handle],
             "resultsPerPage": posts_limit,
@@ -201,7 +224,6 @@ class TikTokApifyClient:
                 timeout_secs=ACTOR_RUN_TIMEOUT_SECS,
             )
         except Exception as e:
-            # Apify SDK raises a variety of exceptions; we normalize to ours.
             log.error("actor_call_failed", error=str(e))
             raise ActorRunFailed(f"Apify actor call failed: {e}") from e
 
@@ -210,7 +232,6 @@ class TikTokApifyClient:
             log.error("actor_run_did_not_succeed", status=status)
             raise ActorRunFailed(f"Actor run status: {status}")
 
-        # Pull results from the run's default dataset.
         dataset_id = run.get("defaultDatasetId")
         if not dataset_id:
             raise ActorRunFailed("Actor run produced no dataset")
@@ -224,28 +245,93 @@ class TikTokApifyClient:
         return self._parse_profile_response(clean_handle, items)
 
     # -------------------------------------------------------------------------
+    # Search-by-keyword
+    # -------------------------------------------------------------------------
+
+    @retry(
+        retry=retry_if_exception_type(ActorRunFailed),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=4, max=30),
+        reraise=True,
+    )
+    def search_posts_by_keyword(
+        self,
+        query: str,
+        posts_limit: int = DEFAULT_POSTS_PER_SEARCH,
+    ) -> list[SearchHit]:
+        """Search TikTok for posts matching a keyword query, return creators.
+
+        Used by the search-term harvest channel. Each query returns up to
+        `posts_limit` recent posts; we extract one SearchHit per unique
+        creator that appears in the results.
+
+        Args:
+            query: Free-text search query (e.g., "lakers reaction", "grwm").
+            posts_limit: Maximum number of posts to fetch for this query.
+
+        Returns:
+            List of SearchHit, one per unique creator surfaced by the query.
+            Order is preserved from the response (most recent first).
+
+        Raises:
+            ActorRunFailed: Actor run failed (after retries).
+        """
+        if not query.strip():
+            raise ValueError("query must be a non-empty string")
+
+        log = logger.bind(query=query, actor=TIKTOK_SEARCH_ACTOR)
+        log.info("searching_posts", posts_limit=posts_limit)
+
+        # The clockworks scraper accepts a "searchQueries" list and returns
+        # posts matching those queries. Configuration is parallel to profile
+        # scraping but with a different input key.
+        actor_input = {
+            "searchQueries": [query],
+            "resultsPerPage": posts_limit,
+            "shouldDownloadVideos": False,
+            "shouldDownloadCovers": False,
+            "shouldDownloadSubtitles": False,
+            "shouldDownloadSlideshowImages": False,
+        }
+
+        try:
+            run = self._client.actor(TIKTOK_SEARCH_ACTOR).call(
+                run_input=actor_input,
+                timeout_secs=ACTOR_RUN_TIMEOUT_SECS,
+            )
+        except Exception as e:
+            log.error("actor_call_failed", error=str(e))
+            raise ActorRunFailed(f"Apify actor call failed: {e}") from e
+
+        if not run or run.get("status") != "SUCCEEDED":
+            status = run.get("status") if run else "UNKNOWN"
+            log.error("actor_run_did_not_succeed", status=status)
+            raise ActorRunFailed(f"Actor run status: {status}")
+
+        dataset_id = run.get("defaultDatasetId")
+        if not dataset_id:
+            log.warning("no_dataset_returned")
+            return []
+
+        items = list(self._client.dataset(dataset_id).iterate_items())
+        log.info("search_run_succeeded", item_count=len(items))
+
+        return self._parse_search_response(items)
+
+    # -------------------------------------------------------------------------
     # Parsing
     # -------------------------------------------------------------------------
-    # Parsing is split out because it's the most likely thing to need updates
-    # when actor responses change. Keep all field-name knowledge in here.
 
     def _parse_profile_response(
         self, requested_handle: str, items: list[dict[str, Any]]
     ) -> TikTokProfile:
-        """Parse the actor's dataset items into a TikTokProfile.
-
-        The clockworks actor returns one item per post, with the creator's
-        profile data nested inside each item under 'authorMeta'. We extract
-        profile data from the first item and treat all items as posts.
-        """
+        """Parse the actor's dataset items into a TikTokProfile."""
         if not items:
             raise CreatorNotFound(f"No items for {requested_handle}")
 
         first = items[0]
         author = first.get("authorMeta") or {}
 
-        # Profile-level fields. If any of these critical fields are missing,
-        # the response shape has changed and we need to update parsing.
         try:
             profile = TikTokProfile(
                 tiktok_user_id=str(author["id"]),
@@ -263,28 +349,69 @@ class TikTokApifyClient:
                 f"Could not extract profile fields: {e}"
             ) from e
 
-        # Parse each item as a post.
         for item in items:
             try:
                 post = self._parse_post(item)
                 profile.posts.append(post)
             except UnexpectedResponseShape as e:
-                # Don't fail the whole fetch if a single post is malformed.
-                # Log and skip; we'd rather have N-1 posts than zero.
                 logger.warning(
-                    "post_parse_failed",
-                    handle=requested_handle,
-                    error=str(e),
+                    "post_parse_failed", handle=requested_handle, error=str(e)
                 )
 
         return profile
 
     @staticmethod
+    def _parse_search_response(items: list[dict[str, Any]]) -> list[SearchHit]:
+        """Parse search results into deduplicated SearchHits.
+
+        Search results are post-shaped (same as profile responses), but each
+        item represents a different creator. We dedupe by tiktok_user_id —
+        if the same creator appears in multiple posts in the result set,
+        we only emit one SearchHit, keeping the first (most recent) post
+        as the surfacing context.
+        """
+        seen_user_ids: set[str] = set()
+        hits: list[SearchHit] = []
+
+        for item in items:
+            author = item.get("authorMeta") or {}
+            user_id_raw = author.get("id")
+            if not user_id_raw:
+                continue
+
+            user_id = str(user_id_raw)
+            if user_id in seen_user_ids:
+                continue
+            seen_user_ids.add(user_id)
+
+            try:
+                hit = SearchHit(
+                    tiktok_user_id=user_id,
+                    handle=author.get("name", ""),
+                    display_name=author.get("nickName"),
+                    # 'fans' is sometimes present in search responses, sometimes not.
+                    # Tolerate absence — we'll get the real count during enrichment.
+                    follower_count=(
+                        int(author["fans"]) if "fans" in author else None
+                    ),
+                    bio=author.get("signature"),
+                    surfacing_post_id=str(item.get("id", "")),
+                    surfacing_post_caption=item.get("text"),
+                )
+                hits.append(hit)
+            except (TypeError, ValueError) as e:
+                logger.warning(
+                    "search_hit_parse_failed",
+                    user_id=user_id,
+                    error=str(e),
+                )
+
+        return hits
+
+    @staticmethod
     def _parse_post(item: dict[str, Any]) -> TikTokPost:
         """Parse a single dataset item into a TikTokPost."""
         try:
-            # Timestamp comes as either ISO string (createTimeISO) or
-            # Unix seconds (createTime). Handle both.
             published_ts = item.get("createTimeISO") or item.get("createTime")
             if isinstance(published_ts, str):
                 published_at = datetime.fromisoformat(

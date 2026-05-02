@@ -7,8 +7,16 @@ database; will produce errors on a populated one if the schema has drifted
 Usage:
     python scripts/init_db.py
 """
-
 from __future__ import annotations
+
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).parent.parent / "src"))
+
+import sys
+from pathlib import Path
+
+from scout.db import get_connection
 
 import sys
 from pathlib import Path

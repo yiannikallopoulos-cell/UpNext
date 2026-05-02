@@ -16,6 +16,7 @@ license = { text = "MIT" }
 dependencies = [
     # Database
     "psycopg[binary]>=3.2",
+    "psycopg-pool>=3.2",
     "sqlalchemy>=2.0",
 
     # External APIs
@@ -47,8 +48,18 @@ dev = [
 [project.scripts]
 upnext = "scout.jobs.cli:main"
 
+# -----------------------------------------------------------------------------
+# Setuptools configuration for the src/ layout.
+# Both package-dir and packages.find are required — package-dir tells
+# setuptools that the package root is src/, packages.find tells it which
+# packages to discover under that root.
+# -----------------------------------------------------------------------------
+[tool.setuptools]
+package-dir = {"" = "src"}
+
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["scout*"]
 
 [tool.ruff]
 line-length = 100
